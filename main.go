@@ -1,12 +1,17 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
+	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -374,6 +379,72 @@ func (h *Handler) UpdateById(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// Health
+
+func Health(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var resp struct {
+		Status string `json:"status"`
+	}
+
+	resp.Status = "ok"
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	err := json.NewEncoder(w).Encode(resp)
+	if err != nil {
+		http.Error(w, "encode error", http.StatusInternalServerError)
+		return
+	}
+
+}
+
+func Ready(db *sql.DB) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		err := db.PingContext(ctx)
+		if err != nil {
+			var resp struct {
+				Status string `json:"status"`
+			}
+
+			resp.Status = "not ready"
+
+			w.Header().Set("Content-type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+
+		var resp struct {
+			Status string `json:"status"`
+		}
+
+		resp.Status = "ready"
+
+		w.Header().Set("Content-type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		err = json.NewEncoder(w).Encode(resp)
+		if err != nil {
+			http.Error(w, "encode error", http.StatusInternalServerError)
+			return
+		}
+	}
+}
+
+// Realisation
 func NewInMemoryRepository() *InMemoryNoteRepository {
 	return &InMemoryNoteRepository{
 		notes:  []Note{},
@@ -400,9 +471,33 @@ func NewHandler(service *Service) *Handler {
 	}
 }
 
+// Config
+type Config struct {
+	HTTPport string
+	DBDSN    string
+}
+
+func LoadConfig() Config {
+	port := os.Getenv("HTTP_PORT")
+	if port == "" {
+		port = ":8080"
+	}
+
+	dsn := os.Getenv("DB_DSN")
+	if dsn == "" {
+		log.Fatal("DB_DSN is required")
+	}
+
+	return Config{
+		HTTPport: port,
+		DBDSN:    dsn,
+	}
+}
+
 func main() {
-	dsn := "user=postgres password=admin host=localhost port=5432 dbname=notesbd sslmode=disable"
-	db, err := sql.Open("pgx", dsn)
+	cfg := LoadConfig()
+
+	db, err := sql.Open("pgx", cfg.DBDSN)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -418,7 +513,12 @@ func main() {
 	service := NewService(repo)
 	handler := NewHandler(service)
 
-	http.HandleFunc("/notes", func(w http.ResponseWriter, r *http.Request) {
+	// Router
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/health", Health)
+	mux.HandleFunc("/health/ready", Ready(db))
+	mux.HandleFunc("/notes", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			id := r.URL.Query().Get("id")
@@ -443,9 +543,36 @@ func main() {
 		}
 	})
 
-	err = http.ListenAndServe(":8080", nil)
-	if err != nil {
-		panic(err)
+	// Server
+	addr := ":" + cfg.HTTPport
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
 	}
+
+	go func() {
+		log.Printf("notes-service starting on %s", addr)
+
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	<-stop
+	log.Println("shutdown signal received")
+
+	// graceful shutdown
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		log.Printf("server shutdown error: %v", err)
+	}
+
+	log.Println("server stopped gracefully")
 
 }
