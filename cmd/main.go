@@ -7,6 +7,9 @@ import (
 	"errors"
 	"log"
 	"net/http"
+	model "notes_service/internal/models"
+	"notes_service/internal/repository"
+	service "notes_service/internal/service"
 	"os"
 	"os/signal"
 	"strconv"
@@ -18,195 +21,8 @@ import (
 
 // Сущность
 
-type Note struct {
-	ID   int    `json:"id"`
-	Text string `json:"text"`
-}
-
-// Repository layer
-
-type NoteRepository interface {
-	Create(note Note) (Note, error)
-	GetAll() ([]Note, error)
-	GetById(id int) (Note, error)
-	DeleteById(id int) error
-	UpdateById(id int, text string) (Note, error)
-}
-
-type InMemoryNoteRepository struct {
-	notes  []Note
-	nextID int
-}
-
-func (r *InMemoryNoteRepository) Create(note Note) (Note, error) {
-	note.ID = r.nextID
-	r.nextID++
-
-	r.notes = append(r.notes, note)
-	return note, nil
-}
-
-func (r *InMemoryNoteRepository) GetAll() ([]Note, error) {
-	return r.notes, nil
-}
-
-type PostgresNoteRepository struct {
-	db *sql.DB
-}
-
-func (p *PostgresNoteRepository) Create(note Note) (Note, error) {
-	query := "INSERT INTO notes (text) VALUES ($1) RETURNING id"
-
-	err := p.db.QueryRow(query, note.Text).Scan(&note.ID)
-	if err != nil {
-		return Note{}, err
-	}
-
-	return note, nil
-}
-
-func (p *PostgresNoteRepository) GetAll() ([]Note, error) {
-	rows, err := p.db.Query("SELECT id, text FROM notes")
-	if err != nil {
-		return nil, err
-	}
-
-	defer rows.Close()
-
-	var notes []Note
-
-	for rows.Next() {
-		var note Note
-		err := rows.Scan(&note.ID, &note.Text)
-		if err != nil {
-			return nil, err
-		}
-
-		notes = append(notes, note)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return notes, nil
-}
-
-func (p *PostgresNoteRepository) GetById(id int) (Note, error) {
-	var note Note
-	err := p.db.QueryRow(
-		"SELECT id, text FROM notes WHERE id = $1", id).Scan(&note.ID, &note.Text)
-	if err != nil {
-		return Note{}, err
-	}
-	return note, nil
-}
-
-func (p *PostgresNoteRepository) DeleteById(id int) error {
-	res, err := p.db.Exec("DELETE FROM notes WHERE id = $1", id)
-	if err != nil {
-		return err
-	}
-
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-
-	if n == 0 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
-func (p *PostgresNoteRepository) UpdateById(id int, text string) (Note, error) {
-
-	var note Note
-	query := "UPDATE notes SET text = $1 WHERE id = $2 RETURNING id, text"
-	err := p.db.QueryRow(query, text, id).Scan(&note.ID, &note.Text)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Note{}, sql.ErrNoRows
-		}
-		return Note{}, err
-	}
-	return note, nil
-}
-
-// Service Layer
-type Service struct {
-	repo NoteRepository
-}
-
-func (s *Service) Create(text string) (Note, error) {
-	note := Note{
-		Text: text,
-	}
-
-	if text == "" {
-		return Note{}, errors.New("Text is required")
-	}
-
-	note, err := s.repo.Create(note)
-	if err != nil {
-		return Note{}, err
-	}
-
-	return note, nil
-
-}
-func (s *Service) GetAll() ([]Note, error) {
-	notes, err := s.repo.GetAll()
-	if err != nil {
-		return nil, err
-	}
-	return notes, nil
-}
-
-func (s *Service) GetById(id int) (Note, error) {
-	var note Note
-	note, err := s.repo.GetById(id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Note{}, err
-		}
-		return Note{}, err
-	}
-	return note, nil
-}
-
-func (s *Service) DeleteById(id int) error {
-	err := s.repo.DeleteById(id)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		return err
-	}
-	return nil
-}
-
-func (s *Service) UpdateById(id int, text string) (Note, error) {
-
-	if text == "" {
-		return Note{}, errors.New("Text is required")
-	}
-
-	note, err := s.repo.UpdateById(id, text)
-	if err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return Note{}, sql.ErrNoRows
-		}
-		return Note{}, err
-	}
-
-	return note, nil
-}
-
-// Hander Layer
-
 type Handler struct {
-	service *Service
+	service *service.Service
 }
 
 func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
@@ -231,8 +47,8 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var resp struct {
-		Status string `json:"status"`
-		Note   Note   `json:"note"`
+		Status string     `json:"status"`
+		Note   model.Note `json:"note"`
 	}
 
 	resp.Note = note
@@ -255,7 +71,7 @@ func (h *Handler) GetAll(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var resp struct {
-		Notes []Note `json:"notes"`
+		Notes []model.Note `json:"notes"`
 	}
 
 	notesGet, err := h.service.GetAll()
@@ -300,7 +116,7 @@ func (h *Handler) GetById(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var resp struct {
-		Note Note `json:"note"`
+		Note model.Note `json:"note"`
 	}
 
 	resp.Note = note
@@ -444,28 +260,7 @@ func Ready(db *sql.DB) http.HandlerFunc {
 	}
 }
 
-// Realisation
-func NewInMemoryRepository() *InMemoryNoteRepository {
-	return &InMemoryNoteRepository{
-		notes:  []Note{},
-		nextID: 1,
-	}
-}
-
-func NewPostgresNoteRepository(db *sql.DB) *PostgresNoteRepository {
-	return &PostgresNoteRepository{
-		db: db,
-	}
-}
-
-func NewService(repo NoteRepository) *Service {
-	return &Service{
-		repo: repo,
-	}
-
-}
-
-func NewHandler(service *Service) *Handler {
+func NewHandler(service *service.Service) *Handler {
 	return &Handler{
 		service: service,
 	}
@@ -509,8 +304,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	repo := NewPostgresNoteRepository(db)
-	service := NewService(repo)
+	repo := repository.NewPostgresNoteRepository(db)
+	service := service.NewService(repo)
 	handler := NewHandler(service)
 
 	// Router
